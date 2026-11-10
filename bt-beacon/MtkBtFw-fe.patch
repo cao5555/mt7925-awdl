@@ -1,0 +1,406 @@
+diff --git a/kexts/MtkBtFw/Info.plist b/kexts/MtkBtFw/Info.plist
+index f568357..d263b32 100644
+--- a/kexts/MtkBtFw/Info.plist
++++ b/kexts/MtkBtFw/Info.plist
+@@ -17,8 +17,8 @@
+ 			<key>CFBundleIdentifier</key><string>com.itlmt7925.mtkbtfw</string>
+ 			<key>IOClass</key><string>MtkBtFw</string>
+ 			<key>IOProviderClass</key><string>IOUSBHostInterface</string>
+-			<key>idVendor</key><integer>1161</integer>
+-			<key>idProduct</key><integer>57630</integer>
++			<key>idVendor</key><integer>3725</integer>
++			<key>idProduct</key><integer>1815</integer>
+ 			<key>bConfigurationValue</key><integer>1</integer>
+ 			<key>bInterfaceNumber</key><integer>0</integer>
+ 		</dict>
+diff --git a/kexts/MtkBtFw/MtkBtFw.cpp b/kexts/MtkBtFw/MtkBtFw.cpp
+index 3dce802..16f21e1 100644
+--- a/kexts/MtkBtFw/MtkBtFw.cpp
++++ b/kexts/MtkBtFw/MtkBtFw.cpp
+@@ -85,13 +85,30 @@ public:
+ private:
+     IOUSBHostInterface *intf = nullptr;
+     IOUSBHostPipe *intrPipe = nullptr;
++    IOUSBHostPipe *cmdPipe = nullptr;                    // OUT pipe: HCI command packets once the chip is in HCI mode
++    uint8_t cmdAddr = 0;
++    uint16_t intrMps = 16;                               // interrupt IN max packet size (matters: the transfer may not exceed it)
++    IOUSBHostPipe *aclPipe = nullptr;                     // bulk IN (0x82): ACL and possibly HCI events
++    IOBufferMemoryDescriptor *aclBuf = nullptr;
++    volatile bool aclBusy = false, aclGot = false;
++    uint8_t aclFirst[64] = {0};
++    volatile uint32_t aclLen = 0;
++    IOBufferMemoryDescriptor *cmdBuf = nullptr;
++    volatile bool cmdBusy = false;
+     IOBufferMemoryDescriptor *intrBuf = nullptr;
+     volatile bool intrStop = false, intrBusy = false;
+     volatile uint32_t intrPackets = 0;
++    volatile uint32_t intrCbs = 0;
++    volatile uint32_t intrLogged = 0;
++    volatile int hciVariant = 0;
++    volatile uint32_t leMetaCnt = 0, leAdvReport = 0, leSetTerm = 0, leMetaLogged = 0;
++    void publishLe(void);
+     uint8_t intrFirst[8] = {0};                     // first interrupt packet, for the log
+     volatile uint32_t intrFirstLen = 0;
+-    volatile bool hciWait = false, hciGot = false;  // HCI Read Local Version probe
+-    uint8_t hciEv[16] = {0};
++    volatile bool hciWait = false, hciGot = false;  // HCI probe: one command in flight
++    uint16_t hciWaitOpcode = 0;                     // opcode the pending command waits for
++    uint8_t hciEv[64] = {0};                        // its command-complete event
++    uint32_t hciEvLen = 0;
+     bool wmtAnswered = false;                       // any WMT event seen in this download attempt
+     uint8_t *cmd = nullptr, *ev = nullptr;          // control transfer buffers (wired)
+     char log[2400] = {0};
+@@ -110,8 +127,12 @@ private:
+     DlResult download();
+     bool subsysReset();
+     bool hciAlive();
++    int hciCmd(uint16_t opcode, const uint8_t *params, uint8_t plen, uint8_t *out, uint32_t outCap);
++    void hciProbe();
+     void intrArm();
+     static void intrDone(void *owner, void *param, IOReturn status, uint32_t bytes);
++    static void cmdDone(void *owner, void *param, IOReturn status, uint32_t bytes);
++    static void aclDone(void *owner, void *param, IOReturn status, uint32_t bytes);
+ };
+ 
+ OSDefineMetaClassAndStructors(MtkBtFw, IOService)
+@@ -296,10 +317,181 @@ bool MtkBtFw::subsysReset()
+ 
+ // HCI Read Local Version Information (0x1001) on the normal HCI path: command on the control endpoint, Command Complete on the
+ // interrupt endpoint. Answered only when the RAM code is running.
++// One HCI command through the control endpoint, waiting for its command-complete event on the interrupt pipe.
++// Returns the HCI status byte, -1 on timeout, -2 when the transfer failed. `out` gets the event parameters after the status.
++int MtkBtFw::hciCmd(uint16_t opcode, const uint8_t *params, uint8_t plen, uint8_t *out, uint32_t outCap)
++{
++    if (!intrPipe || !cmd) return -2;
++    cmd[0] = 0x01;
++    cmd[1] = (uint8_t)(opcode & 0xff);
++    cmd[2] = (uint8_t)(opcode >> 8);
++    cmd[3] = plen;
++    if (plen) memcpy(cmd + 4, params, plen);
++    hciGot = false;
++    hciEvLen = 0;
++    hciWaitOpcode = opcode;
++    hciWait = true;
++    // MediaTek parts take HCI commands on the control endpoint WITHOUT the packet-type byte: with it the chip answers
++    // with a bogus "Command Status" for opcode 0x0101, without it the Command Complete carries our opcode.
++    IOReturn r = ctrl(0x20, 0x00, 0, 0, cmd + 1, (uint16_t)(3 + plen), nullptr);
++    if (r != kIOReturnSuccess) { hciWait = false; return -2; }
++    for (int i = 0; i < 300 && !hciGot; i++) IOSleep(5);
++    hciWait = false;
++    if (!hciGot) return -1;
++    uint32_t status = hciEvLen > 5 ? hciEv[5] : 0xff;
++    if (out && outCap && hciEvLen > 6) {
++        uint32_t n = hciEvLen - 6;
++        if (n > outCap) n = outCap;
++        memcpy(out, hciEv + 6, n);
++    }
++    return (int)status;
++}
++
++// Ask the controller what it can do, before IOBluetoothFamily takes the interface over.
++void MtkBtFw::hciProbe()
++{
++    uint8_t out[48];
++    int st;
++    memset(out, 0, sizeof(out));
++    (void)0;
++#define PROBE_BEGIN() memset(out, 0, sizeof(out))
++
++    if (aclPipe && !aclBuf) {
++        aclBuf = IOBufferMemoryDescriptor::withCapacity(1024, kIODirectionIn);
++        if (aclBuf && aclBuf->prepare(kIODirectionIn) != kIOReturnSuccess) { aclBuf->release(); aclBuf = nullptr; }
++    }
++    if (aclPipe && aclBuf) {
++        IOUSBHostCompletion ac = { this, aclDone, nullptr };
++        aclGot = false; aclLen = 0; aclBusy = true;
++        if (aclPipe->io(aclBuf, 64, &ac, 0) != kIOReturnSuccess) aclBusy = false;
++    }
++    if (intrPipe) { intrPipe->clearStall(true); intrArm(); IOSleep(20); }   // the endpoint may be halted after the mode switch
++    if (cmdPipe) say("probe: HCI via OUT endpoint 0x%02x", cmdAddr);
++    else say("probe: HCI via control pipe (no OUT endpoint found)");
++    st = hciCmd(0x0c03, nullptr, 0, out, sizeof(out));          // HCI Reset: what the host sends first
++    say("probe: HCIReset status=%d", st);
++    IOSleep(50);
++    say("probe: bulkIN got=%u len=%u first=%02x%02x%02x%02x", aclGot ? 1u : 0u, (unsigned)aclLen,
++        aclFirst[0], aclFirst[1], aclFirst[2], aclFirst[3]);
++    st = hciCmd(0x1001, nullptr, 0, out, sizeof(out));
++    say("probe: ReadLocalVersion status=%d hci=%u lmp=%u manuf=%04x", st, st == 0 ? out[0] : 0,
++        st == 0 ? out[2] : 0, st == 0 ? (unsigned)(out[3] | (out[4] << 8)) : 0);
++    st = hciCmd(0x2002, nullptr, 0, out, sizeof(out));
++    say("probe: LEReadBufferSize status=%d size=%u pkts=%u", st, st == 0 ? out[0] : 0, st == 0 ? out[1] : 0);
++    st = hciCmd(0x2003, nullptr, 0, out, sizeof(out));
++    say("probe: LEReadFeatures status=%d %02x%02x%02x%02x%02x%02x%02x%02x", st,
++        out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
++    st = hciCmd(0x2004, nullptr, 0, out, sizeof(out));                   // LE Read Supported States
++    say("probe: LEReadSupportedStates status=%d %02x%02x%02x%02x%02x%02x%02x%02x", st,
++        out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
++    st = hciCmd(0x1003, nullptr, 0, out, sizeof(out));                   // HCI Read Local Supported Features
++    say("probe: ReadLocalFeatures status=%d %02x%02x%02x%02x%02x%02x%02x%02x", st,
++        out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
++    st = hciCmd(0x203d, nullptr, 0, out, sizeof(out));
++    say("probe: LEReadNumAdvSets status=%d n=%u", st, st == 0 ? out[0] : 0);
++    // The controller answers "Command Disallowed" (0x0C) until the host has set the event masks.
++    {
++        uint8_t evmask[8] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
++        st = hciCmd(0x0c01, evmask, 8, out, sizeof(out));                 // HCI Set Event Mask
++        say("probe: SetEventMask status=%d", st);
++        st = hciCmd(0x2001, evmask, 8, out, sizeof(out));                 // LE Set Event Mask
++        say("probe: LESetEventMask status=%d", st);
++        // and read the controller's own address, which advertising as "public" needs
++        uint8_t bd[6] = {0};
++        st = hciCmd(0x1009, nullptr, 0, out, sizeof(out));                // HCI Read BD_ADDR
++        say("probe: ReadBdAddr status=%d %02x:%02x:%02x:%02x:%02x:%02x", st, out[5], out[4], out[3], out[2], out[1], out[0]);
++        (void)bd;
++    }
++    {
++        uint8_t off = 0;
++        st = hciCmd(0x200a, &off, 1, out, sizeof(out));                   // LE Set Advertising Enable = 0 (clear any stale state)
++        say("probe: LESetAdvDisable status=%d", st);
++    }
++    // 15 bytes: interval min/max, type, own/peer addr type, peer addr[6], channel map, filter policy.
++    // The channel map must not be zero; it sits at index 13, not 12.
++    // Extended advertising path: some controllers reject the legacy commands outright.
++    {
++        PROBE_BEGIN();
++        {
++            // Apple devices advertise from a random address; iOS may ignore a public one.
++            uint8_t rnd[6] = { 0x12, 0x34, 0x56, 0x78, 0x9a, 0xc0 };   // top two bits 11 = static random
++            st = hciCmd(0x2005, rnd, sizeof(rnd), out, sizeof(out));   // LE Set Random Address
++            say("probe: LESetRandomAddr status=%d", st);
++        }
++        // bit4 of the properties = "use legacy PDU": the controller then sends ordinary ADV_* PDUs, which every
++        // scanner understands. bit0 connectable, bit1 scannable for that variant.
++        // 0x13 = use legacy PDU + connectable + scannable, which BLE-5 asks for.
++        uint8_t extPar[25] = { 0x00, 0x13, 0x00, 0xa0, 0x00, 0x00, 0xa0, 0x00, 0x00, 0x07,
++                               0x00, 0x00, 0, 0, 0, 0, 0, 0, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00 };
++        st = hciCmd(0x2036, extPar, sizeof(extPar), out, sizeof(out));   // LE Set Extended Advertising Parameters
++        say("probe: LESetExtAdvParams status=%d", st);
++        // AD structures: AirDrop manufacturer data (Apple 0x004C, TLV 0x05 0x12, 18-byte body) plus a local name
++        // so the beacon is identifiable in a scanner.
++        uint8_t ad[64];
++        uint32_t n = 0;
++        // Flags AD first: LE General Discoverable, BR/EDR not supported. Receivers commonly require it.
++        ad[n++] = 0x02; ad[n++] = 0x01; ad[n++] = 0x06;
++        ad[n++] = 0x17;                       // length: 1 type + 2 company + 2 TLV header + 18 payload = 23
++        ad[n++] = 0xff;                       // manufacturer specific data
++        ad[n++] = 0x4c; ad[n++] = 0x00;       // Apple
++        ad[n++] = 0x05; ad[n++] = 0x12;       // AirDrop TLV
++        // 18-byte AirDrop TLV payload, version 3 (owly SPEC BLE-2): 0x40, 3-byte tag, 4 reserved zero,
++        // version 0x03, four 2-byte contact hashes (zero here: Everyone mode), one reserved zero.
++        ad[n++] = 0x40;
++        ad[n++] = 0xaa; ad[n++] = 0xbb; ad[n++] = 0xcc;   // tag
++        ad[n++] = 0x00; ad[n++] = 0x00; ad[n++] = 0x00; ad[n++] = 0x00;
++        ad[n++] = 0x03;                                   // version 3
++        for (int i = 0; i < 8; i++) ad[n++] = 0x00;       // contact hashes: none (Everyone mode wakes)
++        ad[n++] = 0x00;
++        // Legacy PDUs carry at most 31 bytes: 3 (flags) + 24 (manufacturer) + 3 (one-letter name) = 30.
++        ad[n++] = 0x02; ad[n++] = 0x09; ad[n++] = 'M';   // complete local name, one letter
++        uint8_t extData[80];
++        memset(extData, 0, sizeof(extData));
++        extData[0] = 0x00;      // advertising handle
++        extData[1] = 0x03;      // operation: complete data
++        extData[2] = 0x00;      // fragment preference
++        extData[3] = (uint8_t)n;
++        memcpy(extData + 4, ad, n);
++        {
++            char hex[3 * 40 + 1] = {0};
++            uint32_t m = n < 40 ? n : 40;
++            for (uint32_t i = 0; i < m; i++) snprintf(hex + 3 * i, 4, "%02x ", ad[i]);
++            say("adv: AD len=%u: %s", (unsigned)n, hex);
++        }
++        st = hciCmd(0x2037, extData, 4 + n, out, sizeof(out));           // LE Set Extended Advertising Data
++        say("probe: LESetExtAdvData status=%d", st);
++        // enable(1) + num_sets(1) + [handle(1) + duration(2) + max_events(1)] = 6 bytes
++        uint8_t en[6] = { 0x01, 0x01, 0x00, 0x00, 0x00, 0x00 };
++        // The beacon is deliberately NOT enabled: a connectable advertisement makes iOS try a BLE
++        // connection first, which this controller cannot serve. Discovery over the AWDL service alone
++        // is what worked (the iPhone connected over TLS when advertising was off).
++        st = hciCmd(0x2039, en, sizeof(en), out, sizeof(out));            // LE Set Extended Advertising Enable
++        say("probe: LESetExtAdvEnable status=%d", st);
++        if (st == 0) {
++            say("adv: AirDrop beacon up for 3600 s, then the interface goes back to the Bluetooth stack");
++            IOSleep(3600000);
++            say("adv: hold over");
++        }
++    }
++    uint8_t par[15] = { 0xa0, 0x00, 0xa0, 0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0x07, 0x00 };
++    st = hciCmd(0x2006, par, sizeof(par), out, sizeof(out));
++    say("probe: LESetAdvParams status=%d", st);
++    uint8_t ad[31];
++    memset(ad, 0, sizeof(ad));
++    ad[0] = 0x1a; ad[1] = 0xff; ad[2] = 0x4c; ad[3] = 0x00; ad[4] = 0x05; ad[5] = 0x12; ad[6] = 0x40;
++    st = hciCmd(0x2008, ad, sizeof(ad), out, sizeof(out));
++    say("probe: LESetAdvData status=%d", st);
++    uint8_t en = 1;
++    st = hciCmd(0x200a, &en, 1, out, sizeof(out));
++    say("probe: LESetAdvEnable status=%d", st);
++}
++
+ bool MtkBtFw::hciAlive()
+ {
+     if (!intrPipe) { say("hci probe: no interrupt pipe"); return false; }
+     hciGot = false;
++    hciEvLen = 0;
++    hciWaitOpcode = 0x1001;
+     hciWait = true;
+     cmd[0] = 0x01; cmd[1] = 0x10; cmd[2] = 0;
+     IOReturn r = ctrl(0x20, 0x00, 0, 0, cmd, 3, nullptr);
+@@ -312,10 +504,37 @@ bool MtkBtFw::hciAlive()
+     return hciEv[5] == 0;
+ }
+ 
++void MtkBtFw::aclDone(void *owner, void *, IOReturn status, uint32_t bytes)
++{
++    MtkBtFw *me = (MtkBtFw *)owner;
++    me->aclBusy = false;
++    if (status == kIOReturnSuccess && bytes && bytes <= sizeof(me->aclFirst)) {
++        const uint8_t *p = (const uint8_t *)me->aclBuf->getBytesNoCopy();
++        if (p) { memcpy(me->aclFirst, p, bytes); me->aclLen = bytes; me->aclGot = true; }
++    }
++}
++
++void MtkBtFw::publishLe()
++{
++    OSNumber *n1 = OSNumber::withNumber((unsigned long long)leMetaCnt, 32);
++    OSNumber *n2 = OSNumber::withNumber((unsigned long long)leAdvReport, 32);
++    OSNumber *n3 = OSNumber::withNumber((unsigned long long)leSetTerm, 32);
++    if (n1) { setProperty("le-meta", n1); n1->release(); }
++    if (n2) { setProperty("le-adv-report", n2); n2->release(); }
++    if (n3) { setProperty("le-adv-set-term", n3); n3->release(); }
++}
++
++void MtkBtFw::cmdDone(void *owner, void *, IOReturn, uint32_t)
++{
++    MtkBtFw *me = (MtkBtFw *)owner;
++    me->cmdBusy = false;
++}
++
+ void MtkBtFw::intrDone(void *owner, void *, IOReturn status, uint32_t bytes)
+ {
+     MtkBtFw *me = (MtkBtFw *)owner;
+     me->intrBusy = false;
++    if (me->intrCbs < 4) { me->intrCbs++; me->say("intr cb #%u status=%08x bytes=%u", (unsigned)me->intrCbs, (unsigned)status, bytes); }
+     if (status == kIOReturnSuccess && bytes) {
+         const uint8_t *p = (const uint8_t *)me->intrBuf->getBytesNoCopy();
+         if (me->intrPackets == 0 && p) {
+@@ -323,16 +542,41 @@ void MtkBtFw::intrDone(void *owner, void *, IOReturn status, uint32_t bytes)
+             memcpy(me->intrFirst, p, n);
+             me->intrFirstLen = n;
+         }
+-        if (me->hciWait && p && bytes >= 6 && p[0] == 0x0e && p[3] == 0x01 && p[4] == 0x10) {
++        if (p[0] == 0x3e && bytes >= 3) {          // LE Meta event: what the controller says about the advertising
++            me->leMetaCnt++;
++            uint8_t sub = p[2];
++            if (sub == 0x02) me->leAdvReport++;
++            if (sub == 0x12) me->leSetTerm++;
++            me->publishLe();
++            if (me->leMetaLogged < 3) {
++                me->leMetaLogged++;
++                char hex2[3 * 16 + 1] = {0};
++                uint32_t m = bytes < 16 ? bytes : 16;
++                for (uint32_t i = 0; i < m; i++) snprintf(hex2 + 3 * i, 4, "%02x ", p[i]);
++                me->say("le-meta len=%u: %s", bytes, hex2);
++            }
++        }
++        if (me->intrLogged < 12) {
++            me->intrLogged++;
++            char hex[3 * 16 + 1] = {0};
++            uint32_t n = bytes < 16 ? bytes : 16;
++            for (uint32_t i = 0; i < n; i++) snprintf(hex + 3 * i, 4, "%02x ", p[i]);
++            me->say("intr v%d pkt #%u len=%u: %s", me->hciVariant, (unsigned)me->intrLogged, bytes, hex);
++        }
++        if (me->hciWait && p && bytes >= 6 && (p[0] == 0x0e || p[0] == 0x0f) &&
++            ((uint16_t)p[3] | ((uint16_t)p[4] << 8)) == me->hciWaitOpcode) {
+             uint32_t n = bytes < sizeof(me->hciEv) ? bytes : (uint32_t)sizeof(me->hciEv);
+             memset(me->hciEv, 0, sizeof(me->hciEv));
+             memcpy(me->hciEv, p, n);
++            me->hciEvLen = n;
+             me->hciGot = true;
+         } else {
+             me->intrPackets++;
+         }
+     }
+-    if (!me->intrStop && status != kIOReturnAborted && status != kIOReturnNotOpen) me->intrArm();
++    // Rearm after ANY completion, including an aborted transfer: a single abort used to end the event pipe for good,
++    // so no HCI event (and therefore no command-complete) was ever read again.
++    if (!me->intrStop) me->intrArm();
+ }
+ 
+ // HCI events the chip also queues on the interrupt endpoint during setup are read and dropped (Linux has its interrupt URB
+@@ -342,7 +586,11 @@ void MtkBtFw::intrArm()
+     if (!intrPipe || !intrBuf || intrStop) return;
+     IOUSBHostCompletion c = { this, intrDone, nullptr };
+     intrBusy = true;
+-    if (intrPipe->io(intrBuf, (uint32_t)intrBuf->getLength(), &c, 0) != kIOReturnSuccess) intrBusy = false;
++    // An interrupt IN transfer may not exceed the endpoint's max packet size (the 1024-byte buffer was rejected outright,
++    // which is why every read completed as kIOReturnAborted and no HCI event was ever seen).
++    uint32_t len = intrMps ? intrMps : 16;               // never more than the endpoint's max packet size
++    if (len > (uint32_t)intrBuf->getLength()) len = (uint32_t)intrBuf->getLength();
++    if (intrPipe->io(intrBuf, len, &c, 0) != kIOReturnSuccess) intrBusy = false;
+ }
+ 
+ void MtkBtFw::worker(void *arg)
+@@ -366,16 +614,36 @@ void MtkBtFw::run()
+         bool mine = false;
+         while (off + 2 <= total && cfg[off] >= 2 && off + cfg[off] <= total) {
+             const uint8_t *d = cfg + off;
+-            if (d[1] == 4 && d[0] >= 9) mine = d[2] == idesc[2] && d[3] == idesc[3];      // interface: number / alternate
+-            else if (d[1] == 5 && d[0] >= 7 && mine && (d[3] & 3) == 3 && (d[2] & 0x80)) {  // endpoint: interrupt, IN
+-                intrPipe = intf->copyPipe(d[2]);
+-                break;
++            if (d[1] == 4 && d[0] >= 9) {
++                mine = d[2] == idesc[2] && d[3] == idesc[3];      // interface: number / alternate
++                if (mine) say("usb: interface %u alt %u with %u endpoints", d[2], d[3], d[4]);
++            }
++            else if (d[1] == 5 && d[0] >= 7 && mine) {
++                uint8_t epType = d[3] & 3;
++                uint16_t epMps = (uint16_t)(d[4] | (d[5] << 8));
++                say("usb: endpoint 0x%02x type %u mps %u", d[2], epType, epMps);
++                if (epType == 2 && (d[2] & 0x80)) {                       // bulk IN: ACL (and maybe events)
++                    if (!aclPipe) aclPipe = intf->copyPipe(d[2]);
++                }
++                if (epType == 3 && (d[2] & 0x80)) {                       // interrupt IN: HCI events
++                    if (!intrPipe) { intrPipe = intf->copyPipe(d[2]); intrMps = epMps ? epMps : 16; }
++                } else if (!(d[2] & 0x80) && (epType == 2 || epType == 3)) {  // bulk/interrupt OUT: HCI commands
++                    if (!cmdPipe) {
++                        cmdPipe = intf->copyPipe(d[2]);
++                        cmdAddr = d[2];
++                        cmdBuf = IOBufferMemoryDescriptor::withCapacity(512, kIODirectionOut);
++                        if (cmdBuf) cmdBuf->prepare(kIODirectionOut);
++                    }
++                }
+             }
+             off += d[0];
+         }
+     }
+     if (intrPipe) {
+         intrBuf = IOBufferMemoryDescriptor::withCapacity(1024, kIODirectionIn);
++        // The buffer has to be DMA-ready before it is handed to the pipe; without this every interrupt transfer
++        // completed as kIOReturnAborted with zero bytes.
++        if (intrBuf && intrBuf->prepare(kIODirectionIn) != kIOReturnSuccess) { intrBuf->release(); intrBuf = nullptr; }
+         intrArm();
+     }
+ 
+@@ -411,7 +679,21 @@ void MtkBtFw::run()
+             bool on = uhwWrite(REG_EP_RST_OPT, EP_RST_IN_OUT_OPT);
+             uint8_t one = 1, f = 0;
+             if (on && wmt(WMT_FUNC_CTRL, 0, &one, 1, &f) != WMT_OK) on = false;   // btmtk_usb_setup resets on a FUNC_CTRL timeout too
+-            if (on) { say("bluetooth function on (flag %u)", f); ok = true; break; }
++            if (on) {
++                say("bluetooth function on (flag %u)", f);
++                IOSleep(300);
++                // Prime the controller the way Linux does for MediaTek parts (HCI commands on the control endpoint,
++                // class request 0x20) before macOS's own transport opens the device. Fire and forget: no event wait.
++                {
++                    uint8_t b[3] = { 0x03, 0x0c, 0x00 };            // HCI Reset, no packet-type byte
++                    IOReturn pr = ctrl(0x20, 0x00, 0, 0, b, 3, nullptr);
++                    say("prime: HCI Reset on control endpoint -> %08x", (unsigned)pr);
++                }
++                IOSleep(200);
++                hciProbe();                    // let the controller settle before IOBluetoothFamily opens the interface
++                ok = true;
++                break;
++            }
+         }
+         say("attempt %u failed after %llu ms, %u interrupt packets so far", attempt, nowMs() - ta, intrPackets);
+     }

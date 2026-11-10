@@ -1,0 +1,247 @@
+diff --git a/kexts/itlmt7925/Info.plist b/kexts/itlmt7925/Info.plist
+index 70359c3..a81f2ad 100644
+--- a/kexts/itlmt7925/Info.plist
++++ b/kexts/itlmt7925/Info.plist
+@@ -17,7 +17,7 @@
+ 		<dict>
+ 			<key>CFBundleIdentifier</key><string>com.itlmt7925.kext</string>
+ 			<key>IOClass</key><string>itlmt7925</string>
+-			<key>IOPCIMatch</key><string>0x792514c3</string>
++			<key>IOPCIPrimaryMatch</key><string>0x792514c3 0x071714c3</string>
+ 			<key>IOProbeScore</key><integer>2000</integer>
+ 			<key>IOProviderClass</key><string>IOPCIDevice</string>
+ 			<key>itl_ssid</key><string></string>
+diff --git a/kexts/itlmt7925/itlmt7925.hpp b/kexts/itlmt7925/itlmt7925.hpp
+index f02daf8..5f29697 100644
+--- a/kexts/itlmt7925/itlmt7925.hpp
++++ b/kexts/itlmt7925/itlmt7925.hpp
+@@ -29,6 +29,8 @@ struct M3TxOpt {
+     bool *full = nullptr;     // set: no staging slot / descriptor free, the caller keeps the frame (Ethernet output queue)
+     uint8_t pid = 3;          // TXD5.PID echoed in the TX status (TXS) record: 3 host frames, 4/5 AWDL unicast/group data
+     uint8_t omac = 0;         // TXD1.OWN_MAC: 0 the station address, 1 the AWDL address (awdlOwnMacApply)
++    int wcid = -1;            // >= 0: send on this station record instead of the AP's (AWDL peers get their own)
++    uint8_t rate = 0;         // fixed-rate table index; 0 = M3_RATE_IDX (OFDM 6 Mb/s). AWDL data asks for a faster rate.
+ };
+ 
+ struct itl_dma_buf {
+@@ -276,7 +278,7 @@ private:
+     // AWDL data TX (docs/ROADMAP-AWDL.md §10.33): complete 802.11 AWDL data frames from the AWDL interface, sent by the link
+     // thread inside the next AWDL radio window (listen or PSF), when the radio is on a peer's channel.
+     struct AwdlTxSlot { uint32_t len; uint8_t data[1600]; };
+-    static const uint32_t kAwdlTxSlots = 16;
++    static const uint32_t kAwdlTxSlots = 64;
+     AwdlTxSlot awdlDataTxRing[kAwdlTxSlots] = {};
+     volatile uint32_t awdlDataTxHead = 0, awdlDataTxTail = 0;
+     uint32_t awdlDataTxQueued = 0, awdlDataTxSent = 0, awdlDataTxFail = 0, awdlDataTxFull = 0;
+@@ -535,6 +537,13 @@ private:
+     bool baSendAction(const uint8_t *body, size_t blen, uint8_t tid);
+     bool txSlotAlloc(uint32_t *slot, uint16_t *tok);
+     void m3TxFree(const uint8_t *p, uint32_t len);
++    int m3AwdlPeerAdd(const uint8_t *peer, uint8_t wcid);
++    int m3AwdlBssAdd();
++    bool awdlBssAdded = false;
++    bool awdlPeerSta = false;              // the AWDL peer's station record has been accepted
++    uint8_t awdlPeerWcid = 20;             // wcid reserved for that record
++    bool awdlStaOn = false;                // IBSS BSS + peer record both accepted (rc=0) but unicast still gets no ACK: the window timing is the limit, keep the AP path
++    bool awdlStaCfg = false;               // boot args read once
+     void ethDeliver(const uint8_t *frame, uint32_t len);
+     // target AP, captured from a beacon / probe response during the scan
+     bool tgtFound = false;
+diff --git a/kexts/itlmt7925/itlmt7925_m3.cpp b/kexts/itlmt7925/itlmt7925_m3.cpp
+index 83f964a..ea43cbc 100644
+--- a/kexts/itlmt7925/itlmt7925_m3.cpp
++++ b/kexts/itlmt7925/itlmt7925_m3.cpp
+@@ -1472,7 +1472,25 @@ void itlmt7925::awdlDataFlush()
+         if (cmdLock) IOLockUnlock(cmdLock);
+         if (!have) return;
+         M3TxOpt o;
+-        o.qidx = 0x10;                                       // ALTX0, as the PSF/MIF: no BA, no station record for the peer
++        o.qidx = 0x10;                                       // ALTX0, as the PSF/MIF: no BA
++        o.rate = 20;                                         // OFDM 12 Mb/s: the best measured /Ask time without the 6 Mb/s timeout
++        bool grpFrame = len >= 6 && (awdlTxBuf2[4] & 1);
++        if (!grpFrame) {
++            // Unicast to an AWDL peer: give it a station record of its own (IBSS), otherwise the hardware never ACKs its
++            // frames and the sender retransmits until it gives up.
++            if (!awdlStaCfg) {                               // one look at the boot args: itl_awdlsta=0 disables the peer record
++                awdlStaCfg = true;
++                int v = 1;
++                if (PE_parse_boot_argn("itl_awdlsta", &v, sizeof(v)) && !v) awdlStaOn = false;
++            }
++            if (awdlStaOn && !awdlBssAdded) {
++                if (m3AwdlBssAdd() == 0) awdlBssAdded = true;
++            }
++            if (awdlStaOn && awdlBssAdded && !awdlPeerSta) {
++                if (m3AwdlPeerAdd(awdlTxBuf2 + 4, awdlPeerWcid) == 0) awdlPeerSta = true;
++            }
++            if (awdlPeerSta) o.wcid = awdlPeerWcid;
++        }
+         o.rateAdapt = false;
+         o.protect = false;
+         // TXS tells unicast (ACKed or not) from group frames, and unicast to a peer heard in this very window from the rest
+@@ -1485,6 +1503,85 @@ void itlmt7925::awdlDataFlush()
+     }
+ }
+ 
++
++// ---------------------------------------------------------------------------------------------
++
++// ---------------------------------------------------------------------------------------------
++// BSS_INFO_UPDATE for the AWDL link (bss_idx 1, CONNECTION_IBSS_ADHOC, OMAC 1).
++// The peer station record alone did nothing: a wcid is only usable inside a BSS context, and the
++// driver only ever created the infrastructure one. Without this the hardware drops every data
++// frame addressed to a peer (awdl txfree: uc=0/N, no ACK, the sender stalls and retransmits).
++// ---------------------------------------------------------------------------------------------
++int itlmt7925::m3AwdlBssAdd()
++{
++    uint8_t bss[4 + 32];
++    bzero(bss, sizeof(bss));
++    bss[0] = 1;                                              // bss_idx 1 (0 is the infrastructure BSS)
++    uint8_t *b = bss + 4;
++    put16(b + 0, 0);                                         // tag UNI_BSS_INFO_BASIC
++    put16(b + 2, 32);                                        // len
++    b[4] = 1;                                                // active
++    b[5] = 1;                                                // omac_idx: the AWDL address (awdlOwnMacApply)
++    b[6] = 1;                                                // hw_bss_idx
++    b[7] = 0xff;                                             // band_idx auto
++    put32(b + 8, 0x40004);                                   // CONNECTION_IBSS_ADHOC
++    b[12] = 1;                                               // conn_state
++    b[13] = 0;                                               // wmm_idx
++    put16(b + 20, 19);                                       // bmc_tx_wlan_idx (WTBL_RESERVED)
++    put16(b + 26, 19);                                       // sta_idx
++    b[31] = 0;                                               // link_idx
++    int rc = m3Cmd(UNI_BSS_INFO_UPDATE, bss, sizeof(bss), "awdl bss_info(ibss)");
++    m3log("awdl bss_info bss_idx=1 ibss rc=%d", rc);
++    return rc;
++}
++
++// STA_REC_UPDATE for an AWDL peer (mt7925_mcu_sta_cmd, CONNECTION_IBSS_ADHOC).
++// Without a record of its own the hardware never acknowledges the peer's unicast frames and the
++// sender retransmits everything, so a transfer crawls or stalls (awdl txfree: uc=2/27).
++// ---------------------------------------------------------------------------------------------
++int itlmt7925::m3AwdlPeerAdd(const uint8_t *peer, uint8_t wcid)
++{
++    M3Msg m;
++    m.init(8);
++    m.b[0] = M3_BSS_IDX;
++    m.b[1] = wcid;                                           // wlan_idx_lo
++    m.b[4] = 1;                                              // is_tlv_append
++    m.b[5] = 1;                                              // muar_idx: the AWDL OMAC programmed by awdlOwnMacApply
++    m.b[6] = 0;
++
++    uint8_t *b = m.tlv(0, 20);                               // STA_REC_BASIC
++    put32(b + 4, 0x40004);                                   // CONNECTION_IBSS_ADHOC (STA_TYPE_ADHOC | NETWORK_IBSS)
++    b[8] = 2;                                                // CONN_STATE_PORT_SECURE
++    b[9] = 1;                                                // qos
++    put16(b + 10, 0);                                        // aid
++    memcpy(b + 12, peer, 6);
++    put16(b + 18, 3);                                        // EXTRA_INFO_VER | EXTRA_INFO_NEW
++
++    // The rate set has to match the channel the frame goes out on: channels 6/44 are 2.4 GHz/5 GHz mixed use but the
++    // AWDL social channel is usually 149, where only OFDM rates exist.
++    bool g2ch = awdlRocCh && awdlRocCh <= 14;
++    uint8_t *p = m.tlv(0x15, 12);                            // STA_REC_PHY
++    put16(p + 4, g2ch ? (uint16_t)0x0fff : (uint16_t)(0x0fff & ~0x000f));   // basic_rate
++    p[6] = g2ch ? 0x03 : (1u << 3);                          // HR_DSSS | ERP, else OFDM
++
++    uint8_t *ra = m.tlv(1, 16);                              // STA_REC_RA
++    put16(ra + 4, g2ch ? (uint16_t)0x0fff : (uint16_t)((0x0fff & ~0x000f)));   // RA_LEGACY
++
++    uint8_t *st = m.tlv(7, 16);                              // STA_REC_STATE
++    st[4] = 2;                                               // STA_STATE_ASSOC
++
++    uint8_t *h = m.tlv(0x2b, 8);                             // STA_REC_HDR_TRANS
++    h[4] = 0; h[5] = 0;                                      // no DS bits: AWDL data frames are IBSS style
++    h[6] = 1;                                                // dis_rx_hdr_tran
++
++    char nm[40];
++    snprintf(nm, sizeof(nm), "awdl sta_rec wcid=%u", wcid);
++    int rc = m3Cmd(UNI_STA_REC_UPDATE, m.b, m.n, nm);
++    m3log("awdl sta_rec %02x:%02x:%02x:%02x:%02x:%02x wcid=%u rc=%d", peer[0], peer[1], peer[2], peer[3], peer[4], peer[5],
++          wcid, rc);
++    return rc;
++}
++
+ // ---------------------------------------------------------------------------------------------
+ // Management frame TX / RX (mt7925e_tx_prepare_skb + mt7925_mac_write_txwi, CT path with a token in the hw txp)
+ // ---------------------------------------------------------------------------------------------
+@@ -1535,7 +1632,7 @@ bool itlmt7925::m3Tx(const uint8_t *frame, uint32_t len, uint8_t type, uint8_t s
+     // MT_TXD3_BCM stays clear either way: mt7925_mac_write_txwi_80211 raises it only when addr1 (the RA) is group
+     // addressed, which never happens for these ToDS frames (RA = AP BSSID, DA = addr3).
+     bool grp = type == 2 && len >= 18 && (frame[16] & 1);
+-    uint16_t wcid = (grp && grpWcid19) ? M3_BMC_WCID : M3_AP_WCID;
++    uint16_t wcid = o.wcid >= 0 ? (uint16_t)o.wcid : ((grp && grpWcid19) ? M3_BMC_WCID : M3_AP_WCID);
+     put32(w + 0, (len + 32) | (0u << 23) | ((uint32_t)o.qidx << 25));         // TX_BYTES | PKT_FMT=CT | Q_IDX
+     uint32_t hdrLen = (type == 2 && (frame[0] & 0x80)) ? 26 : 24;               // QoS data frames carry the 2-byte QoS control field
+     // wlan idx, HDR_FORMAT=802.11, HDR_INFO, TID; FIXED_RATE unless the firmware's rate control (STA_REC_RA) picks the rate
+@@ -1547,7 +1644,8 @@ bool itlmt7925::m3Tx(const uint8_t *frame, uint32_t len, uint8_t type, uint8_t s
+                       (o.sn >= 0 ? ((1u << 31) | ((uint32_t)(o.sn & 0xfff) << 16)) : 0u));
+     if (grp && stGrpTx < 6) { stGrpTx++; m3log("tx grp len=%u wc=%u", len, wcid); }
+     put32(w + 20, o.rateAdapt ? 0u : (o.pid | (1u << 10)));      // PID (3 = MT_PACKET_ID_FIRST), TX_STATUS_HOST: report completion (none for rate-adapted data)
+-    put32(w + 24, (1u << 2) | (1u << 4) | (1u << 3) | (o.rateAdapt ? 0u : ((uint32_t)M3_RATE_IDX << 16)));   // DAS, MSDU_CNT=1, DIS_MAT, TX_RATE
++    uint32_t rateIdx = o.rate ? (uint32_t)o.rate : (uint32_t)M3_RATE_IDX;
++    put32(w + 24, (1u << 2) | (1u << 4) | (1u << 3) | (o.rateAdapt ? 0u : (rateIdx << 16)));   // DAS, MSDU_CNT=1, DIS_MAT, TX_RATE
+ 
+     put16(w + 32, (uint16_t)(tok | 0x8000));                     // txp.msdu_id[0] | VALID
+     put32(w + 40, (uint32_t)(pa + 128));                         // txp.ptr[0].buf0
+diff --git a/kexts/itlmt7925Native/itlmt7925_awdl.cpp b/kexts/itlmt7925Native/itlmt7925_awdl.cpp
+index 7b71a98..29b7f8b 100644
+--- a/kexts/itlmt7925Native/itlmt7925_awdl.cpp
++++ b/kexts/itlmt7925Native/itlmt7925_awdl.cpp
+@@ -446,6 +446,8 @@ private:
+     uint64_t awdlLsnAtUs = 0;                    // start of the EAW the listen timer is armed for
+     uint8_t awdlLsnCh = 0, awdlLsnSlot = 0, awdlLsnRun = 1;   // awdlLsnRun: EAWs the armed window covers (§10.65)
+     uint32_t awdlLsnWins = 0, awdlLsnTx = 0, awdlLsnFail = 0, awdlPeerTlUpd = 0, awdlSlaveAlign = 0;
++    uint32_t awdlFbIdx = 0;                      // no-peer fallback: social channel rotation index
++    uint64_t awdlFbLastUs = 0;                   // no-peer fallback: start of the last sweep window
+     uint32_t awdlFamilyState = 1;                // the state the Family itself last set
+     uint32_t awdlRoleFromAddr = 0;               // SYNC_STATE with state 1 and another node's address (§10.34)
+     // The channel of each of the 16 sequence slots, from setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE (0 = not present).
+@@ -1179,8 +1181,9 @@ void itlmt7925AwdlInterface::awdlTlTick(uint64_t now)
+     if (awdlPsfDue) { awdlPsfDue--; return; }
+     if (!coreDev || (!awdlPsfTlvLen && !awdlMifTlvLen)) return;
+     awdlPsfDue = awdlPsfEawsNow() - 1;
+-    if (awdlSyncVer >= 4 && awdlListenPeer(now)) {
+-        // A peer is being followed: the frames go out in its next window, on its channel, where it can hear them (§10.32).
++    if (awdlSyncVer >= 4) {
++        // The frames go out in a listen window: on the followed peer's channel when one is known (§10.32), otherwise the
++        // no-peer fallback in awdlLsnArm sweeps the social channels so a peer can be found at all.
+         awdlPsfPending = true;
+         if (!awdlLsnAtUs) awdlLsnArm(now);
+         return;
+@@ -1450,7 +1453,35 @@ void itlmt7925AwdlInterface::awdlLsnArm(uint64_t now)
+     awdlLsnAtUs = 0;
+     if (!awdlSyncEnabled || !awdlTlRunning || awdlSyncVer < 4) return;
+     const AwdlPeerTl *p = awdlListenPeer(now);
+-    if (!p) return;
++    if (!p) {
++        // No peer heard yet: sweep the social channels with a listen-only window so one can be found. Without this
++        // the driver only transmits PSF on its own schedule and never hears anything (rx stays 0, no peer appears).
++        if (!awdlLsnTimer) {
++            IOWorkLoop *wl = getWorkLoop();
++            if (!wl) return;
++            awdlLsnTimer = IOTimerEventSource::timerEventSource(this, awdlLsnTimerFired);
++            if (!awdlLsnTimer) return;
++            if (wl->addEventSource(awdlLsnTimer) != kIOReturnSuccess) {
++                awdlLsnTimer->release();
++                awdlLsnTimer = nullptr;
++                return;
++            }
++        }
++        static const uint8_t kFbCh[3] = { 6, 44, 149 };
++        static const uint64_t kFbPeriodUs = 70000;   // one sweep window per EAW, so the radio really dwells
++        uint64_t real = awdlNowUs();
++        uint64_t wait = 0;
++        if (awdlFbLastUs && real - awdlFbLastUs < kFbPeriodUs) wait = kFbPeriodUs - (real - awdlFbLastUs);
++        awdlLsnCh = kFbCh[awdlFbIdx % 3];
++        awdlFbIdx++;
++        awdlLsnSlot = 0;
++        awdlLsnRun = 1;
++        awdlLsnAtUs = real + wait + 5000;        // 5 ms ahead, enough for the ROC to be granted
++        awdlFbLastUs = awdlLsnAtUs;
++        awdlLsnTimer->cancelTimeout();
++        awdlLsnTimer->setTimeoutUS((uint32_t)(wait + 4000));
++        return;
++    }
+     if (!awdlLsnTimer) {
+         IOWorkLoop *wl = getWorkLoop();
+         if (!wl) return;
